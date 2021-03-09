@@ -1,0 +1,30 @@
+syntax = "proto3";
+
+package minecraft_relay_protocol;
+
+// Top-level message sent between relay servers
+message RelayMessage {
+    oneof inner {
+        RelayGame game = 1;
+        RelayConnect connect = 2;
+        RelayData data = 3;
+    };
+}
+
+message RelayGame {
+    uint64 id = 1;
+    bytes motd = 2;
+    uint64 hops = 3;
+}
+
+message RelayConnect {
+    uint64 game_id = 1;
+    uint64 connection_id = 2;
+    uint64 hops = 3;
+}
+
+message RelayData {
+    uint64 connection_id = 1;
+    bool connection_local = 2;
+    bytes data = 3;
+}
