@@ -8,7 +8,9 @@ use crate::discovery::{DiscoveryPacket, DiscoverySender};
 use crate::game::{GameConnection, GameConnectionHandle, GameListener, GameListenerHandle};
 use crate::id_map::IdMap;
 use async_io::Timer;
+use async_net::AsyncToSocketAddrs;
 use bytes::Bytes;
+use core::fmt::Debug;
 use derive_more::{From, Into};
 use minecraft_relay_protocol::{relay_message, RelayConnect, RelayData, RelayGame, RelayMessage};
 use std::collections::{hash_map, HashMap};
@@ -136,12 +138,14 @@ impl Relay {
         Ok(())
     }
 
-    pub fn connect(&self, addr: SocketAddr) {
+    pub fn connect<A>(&self, addr: A)
+    where A: AsyncToSocketAddrs + Clone + Debug + Send + 'static,
+    {
         let tx = self.tx.clone();
         std::thread::spawn(move || async_io::block_on(async {
             loop {
                 let reconnect_time = Timer::after(RELAY_CONNECT_TIMEOUT);
-                match RelayConnection::connect(addr, RELAY_CONNECT_TIMEOUT).await {
+                match RelayConnection::connect(addr.clone(), RELAY_CONNECT_TIMEOUT).await {
                     Ok(connection) => {
                         let addr = connection.peer_addr();
                         log::info!("connected to relay {}", addr);
@@ -161,7 +165,7 @@ impl Relay {
                             return;
                         }
                     }
-                    Err(error) => log::info!("error connecting to relay {}: {}", addr, error),
+                    Err(error) => log::info!("error connecting to relay {:?}: {}", addr, error),
                 }
                 reconnect_time.await;
             }

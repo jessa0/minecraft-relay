@@ -12,8 +12,7 @@ fn main() {
     let mut relay = Relay::new().unwrap();
     relay.listen("0.0.0.0:25566").unwrap();
 
-    if let Some(connect_addr_arg) = args.next() {
-        let connect_addr = connect_addr_arg.parse().unwrap();
+    if let Some(connect_addr) = args.next() {
         relay.connect(connect_addr);
 
         let relay_handle = relay.handle();
