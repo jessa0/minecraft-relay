@@ -68,8 +68,7 @@ impl DiscoveryListener {
             let (len, from) = self.socket.recv_from(&mut buf)?;
             match DiscoveryPacket::parse(&buf[..len]) {
                 Ok(packet) => callback(from, packet),
-                Err(error) =>
-                    log::warn!("error parsing discovery packet from {}: {:?}", &from, error),
+                Err(error) => log::warn!("error parsing discovery packet from {}: {:?}", &from, error),
             }
         }
     }
@@ -106,8 +105,8 @@ impl<'a> DiscoveryPacket<'a> {
         let (_, map) = elements(data).map_err(DiscoveryPacketParseError::ParseError)?;
 
         let port_data = map.get(&b"AD"[..]).ok_or(DiscoveryPacketParseError::InvalidPort(b""))?;
-        let port = str::from_utf8(port_data).map_err(|_| DiscoveryPacketParseError::InvalidPort(port_data))?
-                                            .parse().map_err(|_| DiscoveryPacketParseError::InvalidPort(port_data))?;
+        let port = str::from_utf8(port_data).map_err(|_| DiscoveryPacketParseError::InvalidPort(port_data))?;
+        let port = port.parse().map_err(|_| DiscoveryPacketParseError::InvalidPort(port_data))?;
         let motd = map.get(&b"MOTD"[..]).map(|motd| *motd).unwrap_or_default();
         Ok(Self { port, motd })
     }
@@ -133,11 +132,10 @@ impl<'a> DiscoveryPacket<'a> {
 //
 
 fn elements(input: &[u8]) -> IResult<&[u8], HashMap<&[u8], &[u8]>> {
-    nom::multi::fold_many0(
-        element,
-        Default::default(),
-        |mut map: HashMap<_, _>, (k, v)| { map.insert(k, v); map },
-    )(input)
+    nom::multi::fold_many0(element, Default::default(), |mut map: HashMap<_, _>, (k, v)| {
+        map.insert(k, v);
+        map
+    })(input)
 }
 
 fn element(input: &[u8]) -> IResult<&[u8], (&[u8], &[u8])> {

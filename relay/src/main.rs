@@ -16,7 +16,6 @@ fn main() {
         let connect_addr = connect_addr_arg.parse().unwrap();
         relay.connect(connect_addr);
 
-
         let relay_handle = relay.handle();
         std::thread::spawn(move || {
             discovery_listener.run(|mut from, packet| {

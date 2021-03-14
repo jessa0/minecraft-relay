@@ -9,10 +9,10 @@ use std::io;
 use std::net::SocketAddr;
 
 pub struct GameConnection {
-    stream: TcpStream,
+    stream:    TcpStream,
     peer_addr: SocketAddr,
-    tx: GameConnectionHandle,
-    rx: Receiver<Bytes>,
+    tx:        GameConnectionHandle,
+    rx:        Receiver<Bytes>,
 }
 
 #[derive(Clone)]
@@ -39,10 +39,11 @@ impl GameConnection {
     }
 
     pub async fn connect<A: AsyncToSocketAddrs>(addr: A, timeout: Duration) -> io::Result<Self> {
-        let stream = TcpStream::connect(addr).or(async {
+        let timeout = async {
             Timer::after(timeout).await;
             Err(io::ErrorKind::TimedOut.into())
-        }).await?;
+        };
+        let stream = TcpStream::connect(addr).or(timeout).await?;
         let peer_addr = stream.peer_addr()?;
         Self::new(peer_addr, stream)
     }

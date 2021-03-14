@@ -1,17 +1,17 @@
+use super::GameConnection;
 use async_io::{Async, Timer};
 use futures_lite::FutureExt;
 use std::convert::TryFrom;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
-use std::sync::{Arc, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
-use super::GameConnection;
 
 pub struct GameListener {
-    listener: TcpListener,
+    listener:   TcpListener,
     local_addr: SocketAddr,
-    keepalive: Arc<AtomicBool>,
+    keepalive:  Arc<AtomicBool>,
 }
 
 pub struct GameListenerHandle {

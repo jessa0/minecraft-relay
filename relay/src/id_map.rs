@@ -2,7 +2,7 @@ use core::hash::Hash;
 use std::collections::HashMap;
 
 pub struct IdMap<K, V> {
-    pub map: HashMap<K, V>,
+    pub map:  HashMap<K, V>,
     next_key: u64,
 }
 
@@ -25,7 +25,7 @@ where K: Clone + Eq + From<u64> + Hash,
 impl<K, V> Default for IdMap<K, V> {
     fn default() -> Self {
         Self {
-            map: Default::default(),
+            map:      Default::default(),
             next_key: Default::default(),
         }
     }

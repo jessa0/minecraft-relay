@@ -26,7 +26,7 @@ impl RelayListener {
         self.listener.local_addr()
     }
 
-    pub fn run<E: Error, F: FnMut(RelayConnection) -> Result<(),E >>(&self, mut fun: F) -> Result<(), RelayListenerError<E>> {
+    pub fn run<E: Error, F: FnMut(RelayConnection) -> Result<(), E>>(&self, mut fun: F) -> Result<(), RelayListenerError<E>> {
         for stream in self.listener.incoming() {
             match handle_connection(stream?) {
                 Ok(connection) => fun(connection).map_err(RelayListenerError::Returned)?,
