@@ -95,6 +95,7 @@ enum Message {
     AddPeer(RelayConnectionHandle, mpsc::Sender<PeerId>),
     AddLocalGame(LocalGame, Bytes),
     Recv(PeerId, RelayMessage),
+    RemovePeer(PeerId),
 }
 
 const MAX_FORWARDING_HOPS: u64 = 2;
@@ -145,7 +146,9 @@ impl Relay {
                         let addr = connection.peer_addr();
                         log::info!("connected to relay {}", addr);
                         let (reply_tx, reply_rx) = mpsc::channel();
-                        let _ = tx.send(Message::AddPeer(connection.handle(), reply_tx));
+                        if let Err(_) = tx.send(Message::AddPeer(connection.handle(), reply_tx)) {
+                            return;
+                        }
                         let id = match reply_rx.recv() {
                             Ok(id) => id,
                             Err(_) => break,
@@ -153,6 +156,9 @@ impl Relay {
                         match connection.run(|message| tx.send(Message::Recv(id, message))) {
                             Ok(()) => log::debug!("relay connection to {} closed", addr),
                             Err(error) => log::info!("error reading from relay connection {}: {}", addr, error),
+                        }
+                        if let Err(_) = tx.send(Message::RemovePeer(id)) {
+                            return;
                         }
                     }
                     Err(error) =>
@@ -180,6 +186,8 @@ impl Relay {
                     self.add_local_game(local_game, motd),
                 Message::Recv(from, message) =>
                     self.handle_peer_message(from, message),
+                Message::RemovePeer(peer_id) =>
+                    self.remove_peer(&peer_id),
             }
         }
     }
@@ -263,13 +271,15 @@ impl Relay {
 
         peer.local_connections.insert(connection_id, LocalConnection { tx });
 
-        let _ignore = peer.handle.send(RelayMessage {
+        if let Err(_) = peer.handle.send(RelayMessage {
             inner: Some(relay_message::Inner::Data(RelayData {
                 connection_id: connection_id.id,
                 connection_local: connection_id.local,
                 data: Default::default(),
             })),
-        });
+        }) {
+            self.remove_peer(&from);
+        }
     }
 
     fn add_local_game(&mut self, local_game: LocalGame, motd: Bytes) {
@@ -281,14 +291,20 @@ impl Relay {
             game_id
         });
         log::debug!("forwarding advertisement for {:?}", game_id);
-        for (_peer_id, peer) in &self.peers.map {
-            let _ = peer.handle.send(RelayMessage {
+        let mut errors = Vec::new();
+        for (peer_id, peer) in &self.peers.map {
+            if let Err(_) = peer.handle.send(RelayMessage {
                 inner: Some(relay_message::Inner::Game(RelayGame {
                     id: game_id.0,
                     motd: motd.clone(),
                     hops: 0,
                 })),
-            });
+            }) {
+                errors.push(*peer_id);
+            }
+        }
+        for peer_id in errors {
+            self.remove_peer(&peer_id);
         }
     }
 
@@ -382,10 +398,14 @@ impl Relay {
         if let Some(listener) = &mut remote_game.listener {
             log::debug!("sending advertisement for listener for {:?} on {} for {:?} on {:?}",
                         local_game_id, listener.addr, remote_game_id, from);
-            let _ = self.discovery_tx.send(&DiscoveryPacket {
+            let packet = DiscoveryPacket {
                 port: listener.addr.port(),
                 motd: &game_message.motd,
-            });
+            };
+            match self.discovery_tx.send(&packet) {
+                Ok(()) => (),
+                Err(error) => log::warn!("error sending game advertisement: {:?}", error),
+            }
         }
 
         Some(relayed_game_entry)
@@ -399,16 +419,22 @@ impl Relay {
         if self.peers.map.len() > 1 {
             log::debug!("forwarding {:?} from {:?} to {} peers", game_id, from, self.peers.map.len() - 1);
         }
+        let mut errors = Vec::new();
         for (peer_id, peer) in &self.peers.map {
             if *peer_id != from {
-                let _ = peer.handle.send(RelayMessage {
+                if let Err(_) = peer.handle.send(RelayMessage {
                     inner: Some(relay_message::Inner::Game(RelayGame {
                         id: game_id.0,
                         motd: game_message.motd.clone(),
                         hops: game_message.hops + 1,
                     })),
-                });
+                }) {
+                    errors.push(*peer_id);
+                }
             }
+        }
+        for peer_id in errors {
+            self.remove_peer(&peer_id);
         }
     }
 
@@ -439,7 +465,9 @@ impl Relay {
             match GameConnection::connect(addr, GAME_CONNECT_TIMEOUT) {
                 Ok(connection) => {
                     log::debug!("connected {:?} for {:?} to {:?} at {}", connection_id, from, game_id, addr);
-                    let _ignore = tx.send(Message::AddGameConnection(from, connection_id, game_id, connection.handle()));
+                    if let Err(_) = tx.send(Message::AddGameConnection(from, connection_id, game_id, connection.handle())) {
+                        return;
+                    }
                     match connection.run(move |data| peer_tx.send(RelayMessage {
                         inner: Some(relay_message::Inner::Data(RelayData {
                             connection_id: connection_id.id,
@@ -492,13 +520,16 @@ impl Relay {
         log::debug!("forwarding connection {:?} from {:?} to {:?} with {:?} on {:?}",
                     from_connection_id, from, to_game_id, to_connection_id, to);
 
-        let _ = to_peer.handle.send(RelayMessage {
+        if let Err(_) = to_peer.handle.send(RelayMessage {
             inner: Some(relay_message::Inner::Connect(RelayConnect {
                 game_id: to_game_id.0,
                 connection_id: to_connection_id.id,
                 hops: connect_message.hops + 1,
             })),
-        });
+        }) {
+            self.remove_peer(&to);
+            return;
+        }
 
         let from_peer = match self.peers.map.get_mut(&from) {
             Some(from_peer) => from_peer,
@@ -510,10 +541,10 @@ impl Relay {
         });
     }
 
-    fn handle_data(&self, from: PeerId, data_message: RelayData) {
+    fn handle_data(&mut self, from: PeerId, data_message: RelayData) {
         let from_connection_id = ConnectionId { id: data_message.connection_id, local: data_message.connection_local };
 
-        let from_peer = match self.peers.map.get(&from) {
+        let from_peer = match self.peers.map.get_mut(&from) {
             Some(from_peer) => from_peer,
             None => {
                 log::debug!("dropping data packet for {:?} from unknown {:?}", from_connection_id, from);
@@ -521,8 +552,10 @@ impl Relay {
             }
         };
 
-        if let Some(local_connection) = from_peer.local_connections.get(&from_connection_id) {
-            let _ = local_connection.tx.send(data_message.data);
+        if let hash_map::Entry::Occupied(local_connection) = from_peer.local_connections.entry(from_connection_id) {
+            if let Err(_) = local_connection.get().tx.send(data_message.data) {
+                local_connection.remove();
+            }
         } else {
             let from_connection = match from_peer.relayed_connections.get(&from_connection_id) {
                 Some(from_connection) => from_connection,
@@ -542,13 +575,29 @@ impl Relay {
                 }
             };
 
-            let _ = to_peer.handle.send(RelayMessage {
+            if let Err(_) = to_peer.handle.send(RelayMessage {
                 inner: Some(relay_message::Inner::Data(RelayData {
                     connection_id: to_connection_id.id,
                     connection_local: to_connection_id.local,
                     data: data_message.data,
                 })),
-            });
+            }) {
+                self.remove_peer(&to);
+            }
+        }
+    }
+
+    fn remove_peer(&mut self, peer_id: &PeerId) {
+        let peer = match self.peers.map.get(peer_id) {
+            Some(peer) => peer,
+            None => return,
+        };
+
+        for (_, game) in &peer.games {
+            self.games.map.remove(&game.local_game_id);
+        }
+        if self.games.map.len() < self.games.map.capacity() / 4 {
+            self.games.map.shrink_to_fit();
         }
     }
 }
