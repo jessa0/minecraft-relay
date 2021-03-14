@@ -6,7 +6,7 @@ pub use self::listener::RelayListener;
 
 use bytes::Bytes;
 use crate::discovery::{DiscoveryPacket, DiscoverySender};
-use crate::game::{GameConnection, GameConnectionHandle, GameListener};
+use crate::game::{GameConnection, GameConnectionHandle, GameListener, GameListenerHandle};
 use crate::id_map::IdMap;
 use derive_more::{From, Into};
 use minecraft_relay_protocol::{RelayConnect, RelayData, RelayGame, RelayMessage, relay_message};
@@ -80,7 +80,12 @@ struct LocalGame {
 struct RemoteGame {
     peer_id: PeerId,
     remote_game_id: RemoteGameId,
-    listener_addr: Option<SocketAddr>,
+    listener: Option<RemoteGameListener>,
+}
+
+struct RemoteGameListener {
+    handle: GameListenerHandle,
+    addr: SocketAddr,
 }
 
 enum Message {
@@ -323,37 +328,62 @@ impl Relay {
         let local_game_id = relayed_game_entry.local_game_id;
         let game = match self.games.map.entry(local_game_id) {
             hash_map::Entry::Vacant(game_entry) => {
-                let listener_addr = match GameListener::new() {
-                    Ok(listener) => {
-                        let listener_addr = listener.local_addr();
-                        let tx = self.tx.clone();
-                        let _ = listener.start(move |connection| {
-                            tx.send(Message::AcceptGameConnection(local_game_id, connection)).map_err(|_| anyhow::anyhow!("relay stopped"))
-                        });
-                        log::info!("started listener for {:?} on {} for {:?} on {:?}",
-                                   local_game_id, listener_addr, remote_game_id, from);
-                        Some(listener_addr)
-                    }
-                    Err(error) => {
-                        log::warn!("error starting game listener for {:?} for {:?} on {:?}: {:?}",
-                                   local_game_id, remote_game_id, from, error);
-                        None
-                    }
-                };
                 game_entry.insert(Game::Remote(RemoteGame {
                     peer_id: from,
                     remote_game_id,
-                    listener_addr,
+                    listener: None,
                 }))
             }
             hash_map::Entry::Occupied(game_entry) =>
                 game_entry.into_mut(),
         };
-        if let Game::Remote(RemoteGame { listener_addr: Some(listener_addr), .. }) = game {
+
+        let remote_game = match game {
+            Game::Remote(remote_game) => remote_game,
+            _ => return None,
+        };
+
+        if let Some(listener) = &mut remote_game.listener {
+            if let Err(_) = listener.handle.keepalive() {
+                remote_game.listener = None;
+            }
+        }
+
+        if let None = remote_game.listener {
+            remote_game.listener = match GameListener::new() {
+                Ok(listener) => {
+                    let listener_addr = listener.local_addr();
+                    let listener_handle = listener.handle();
+                    let tx = self.tx.clone();
+                    std::thread::spawn(move || {
+                        match listener.run(move |connection| {
+                            tx.send(Message::AcceptGameConnection(local_game_id, connection))
+                        }) {
+                            Ok(()) =>
+                                log::info!("listener for {:?} on {} for {:?} on {:?} closed",
+                                           local_game_id, listener_addr, remote_game_id, from),
+                            Err(error) =>
+                                log::info!("error listening for {:?} on {} for {:?} on {:?}: {:?}",
+                                           local_game_id, listener_addr, remote_game_id, from, error),
+                        }
+                    });
+                    log::info!("started listener for {:?} on {} for {:?} on {:?}",
+                               local_game_id, listener_addr, remote_game_id, from);
+                    Some(RemoteGameListener { handle: listener_handle, addr: listener_addr })
+                }
+                Err(error) => {
+                    log::warn!("error starting game listener for {:?} for {:?} on {:?}: {:?}",
+                               local_game_id, remote_game_id, from, error);
+                    None
+                }
+            };
+        }
+
+        if let Some(listener) = &mut remote_game.listener {
             log::debug!("sending advertisement for listener for {:?} on {} for {:?} on {:?}",
-                        local_game_id, listener_addr, remote_game_id, from);
+                        local_game_id, listener.addr, remote_game_id, from);
             let _ = self.discovery_tx.send(&DiscoveryPacket {
-                port: listener_addr.port(),
+                port: listener.addr.port(),
                 motd: &game_message.motd,
             });
         }
