@@ -49,9 +49,7 @@ impl GameListener {
             loop {
                 match listener.accept().or(timeout(ACCEPT_TIMEOUT)).await {
                     Ok((stream, peer_addr)) => {
-                        let stream = stream.into_inner()?;
-                        stream.set_nonblocking(false)?;
-                        let connection = GameConnection::new(peer_addr, stream)?;
+                        let connection = GameConnection::new(peer_addr, stream.into())?;
                         fun(connection)?;
                         keepalive.store(false, Ordering::Release);
                     }

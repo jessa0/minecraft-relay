@@ -1,19 +1,22 @@
+use async_channel::{Receiver, Sender};
+use async_io::Timer;
+use async_net::{AsyncToSocketAddrs, TcpStream};
 use bytes::Bytes;
 use core::time::Duration;
+use futures_lite::{AsyncReadExt, AsyncWriteExt, FutureExt};
 use std::error::Error;
-use std::io::{self, Write, Read};
-use std::net::{SocketAddr, TcpStream};
-use std::sync::mpsc;
+use std::io;
+use std::net::SocketAddr;
 
 pub struct GameConnection {
     stream: TcpStream,
     peer_addr: SocketAddr,
     tx: GameConnectionHandle,
-    rx: mpsc::Receiver<Bytes>,
+    rx: Receiver<Bytes>,
 }
 
 #[derive(Clone)]
-pub struct GameConnectionHandle(mpsc::Sender<Bytes>);
+pub struct GameConnectionHandle(Sender<Bytes>);
 
 #[derive(Debug, thiserror::Error)]
 #[error("connection closed")]
@@ -30,14 +33,18 @@ pub enum GameConnectionError<T: std::fmt::Debug> {
 impl GameConnection {
     pub fn new(peer_addr: SocketAddr, stream: TcpStream) -> io::Result<Self> {
         stream.set_nodelay(true)?;
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = async_channel::unbounded();
         let tx = GameConnectionHandle(tx);
         Ok(Self { stream, peer_addr, tx, rx })
     }
 
-    pub fn connect(addr: SocketAddr, timeout: Duration) -> io::Result<Self> {
-        let stream = TcpStream::connect_timeout(&addr, timeout)?;
-        Self::new(addr, stream)
+    pub async fn connect<A: AsyncToSocketAddrs>(addr: A, timeout: Duration) -> io::Result<Self> {
+        let stream = TcpStream::connect(addr).or(async {
+            Timer::after(timeout).await;
+            Err(io::ErrorKind::TimedOut.into())
+        }).await?;
+        let peer_addr = stream.peer_addr()?;
+        Self::new(peer_addr, stream)
     }
 
     pub fn handle(&self) -> GameConnectionHandle {
@@ -48,12 +55,11 @@ impl GameConnection {
         self.peer_addr
     }
 
-    pub fn run<E, F>(self, fun: F) -> Result<(), GameConnectionError<E>>
+    pub async fn run<E, F>(self, fun: F) -> Result<(), GameConnectionError<E>>
     where E: Error + 'static,
           F: FnMut(&[u8]) -> Result<(), E>,
     {
-        start_writer_thread(self.peer_addr, self.stream.try_clone()?, self.rx);
-        read_loop(self.stream, fun)
+        read_loop(self.stream.clone(), fun).or(write_loop(self.stream, self.rx)).await
     }
 }
 
@@ -63,7 +69,7 @@ impl GameConnection {
 
 impl GameConnectionHandle {
     pub fn send(&self, data: Bytes) -> Result<(), GameConnectionClosedError> {
-        self.0.send(data).map_err(|_| GameConnectionClosedError)
+        self.0.try_send(data).map_err(|_| GameConnectionClosedError)
     }
 }
 
@@ -71,29 +77,22 @@ impl GameConnectionHandle {
 // private
 //
 
-fn start_writer_thread(peer_addr: SocketAddr, stream: TcpStream, rx: mpsc::Receiver<Bytes>) {
-    std::thread::spawn(move || {
-        match write_loop(stream, rx) {
-            Ok(()) => log::debug!("game connection {} closed", peer_addr),
-            Err(error) => log::debug!("error writing on game connection {}: {:?}", peer_addr, error),
-        }
-    });
-}
-
-fn write_loop(mut stream: TcpStream, rx: mpsc::Receiver<Bytes>) -> io::Result<()> {
-    for data in rx {
-        stream.write_all(&data)?;
+async fn write_loop<E>(mut stream: TcpStream, rx: Receiver<Bytes>) -> Result<(), GameConnectionError<E>>
+where E: Error + 'static,
+{
+    while let Ok(data) = rx.recv().await {
+        stream.write_all(&data).await?;
     }
     Ok(())
 }
 
-fn read_loop<E, F>(mut stream: TcpStream, mut fun: F) -> Result<(), GameConnectionError<E>>
+async fn read_loop<E, F>(mut stream: TcpStream, mut fun: F) -> Result<(), GameConnectionError<E>>
     where E: Error + 'static,
           F: FnMut(&[u8]) -> Result<(), E>,
 {
     let mut buf = [0; 16384];
     loop {
-        let len = stream.read(&mut buf)?;
+        let len = stream.read(&mut buf).await?;
         if len == 0 {
             return Ok(());
         }

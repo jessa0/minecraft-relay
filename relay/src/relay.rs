@@ -4,6 +4,7 @@ mod listener;
 pub use self::connection::{RelayConnection, RelayConnectionHandle};
 pub use self::listener::RelayListener;
 
+use async_io::Timer;
 use bytes::Bytes;
 use crate::discovery::{DiscoveryPacket, DiscoverySender};
 use crate::game::{GameConnection, GameConnectionHandle, GameListener, GameListenerHandle};
@@ -14,7 +15,7 @@ use std::collections::{HashMap, hash_map};
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 pub struct Relay {
     peers: IdMap<PeerId, Peer>,
@@ -138,10 +139,10 @@ impl Relay {
 
     pub fn connect(&self, addr: SocketAddr) {
         let tx = self.tx.clone();
-        std::thread::spawn(move || {
+        std::thread::spawn(move || async_io::block_on(async {
             loop {
-                let reconnect_time = Instant::now() + RELAY_CONNECT_TIMEOUT;
-                match RelayConnection::connect(addr, RELAY_CONNECT_TIMEOUT) {
+                let reconnect_time = Timer::after(RELAY_CONNECT_TIMEOUT);
+                match RelayConnection::connect(addr, RELAY_CONNECT_TIMEOUT).await {
                     Ok(connection) => {
                         let addr = connection.peer_addr();
                         log::info!("connected to relay {}", addr);
@@ -153,7 +154,7 @@ impl Relay {
                             Ok(id) => id,
                             Err(_) => break,
                         };
-                        match connection.run(|message| tx.send(Message::Recv(id, message))) {
+                        match connection.run(|message| tx.send(Message::Recv(id, message))).await {
                             Ok(()) => log::debug!("relay connection to {} closed", addr),
                             Err(error) => log::info!("error reading from relay connection {}: {}", addr, error),
                         }
@@ -164,11 +165,9 @@ impl Relay {
                     Err(error) =>
                         log::info!("error connecting to relay {}: {}", addr, error),
                 }
-                if let Some(sleep_duration) = reconnect_time.checked_duration_since(Instant::now()) {
-                    std::thread::sleep(sleep_duration);
-                }
+                reconnect_time.await;
             }
-        });
+        }));
     }
 
     pub fn run(&mut self) {
@@ -231,13 +230,13 @@ impl Relay {
                             connection_id, game_id, peer_addr, remote_game_id, peer_id);
                 return;
             }
-            match connection.run(|data| peer_tx.send(RelayMessage {
+            match async_io::block_on(connection.run(|data| peer_tx.send(RelayMessage {
                 inner: Some(relay_message::Inner::Data(RelayData {
                     connection_id: connection_id.id,
                     connection_local: connection_id.local,
                     data: data.to_vec().into(),
                 })),
-            })) {
+            }))) {
                 Ok(()) => log::debug!("{:?} for {:?} from {} for {:?} on {:?} closed",
                                       connection_id, game_id, peer_addr, remote_game_id, peer_id),
                 Err(error) => log::debug!("error reading on {:?} for {:?}from {} for {:?} on {:?}: {:?}",
@@ -251,13 +250,13 @@ impl Relay {
         log::info!("accepted relay connection from {} for {:?}", connection.peer_addr(), peer_id);
 
         let tx = self.tx.clone();
-        std::thread::spawn(move || {
+        std::thread::spawn(move || async_io::block_on(async {
             let addr = connection.peer_addr();
-            match connection.run(|message| tx.send(Message::Recv(peer_id, message))) {
+            match connection.run(|message| tx.send(Message::Recv(peer_id, message))).await {
                 Ok(()) => log::debug!("relay connection from {} for {:?} closed", addr, peer_id),
                 Err(error) => log::info!("error reading from relay connection from {} for {:?}: {}", addr, peer_id, error),
             }
-        });
+        }));
     }
 
     fn add_game_connection(&mut self, from: PeerId, connection_id: ConnectionId, game_id: LocalGameId, tx: GameConnectionHandle) {
@@ -461,8 +460,8 @@ impl Relay {
         };
         let tx = self.tx.clone();
         let peer_tx = peer.handle.clone();
-        std::thread::spawn(move || {
-            match GameConnection::connect(addr, GAME_CONNECT_TIMEOUT) {
+        std::thread::spawn(move || async_io::block_on(async {
+            match GameConnection::connect(addr, GAME_CONNECT_TIMEOUT).await {
                 Ok(connection) => {
                     log::debug!("connected {:?} for {:?} to {:?} at {}", connection_id, from, game_id, addr);
                     if let Err(_) = tx.send(Message::AddGameConnection(from, connection_id, game_id, connection.handle())) {
@@ -474,7 +473,7 @@ impl Relay {
                             connection_local: connection_id.local,
                             data: data.to_vec().into(),
                         })),
-                    })) {
+                    })).await {
                         Ok(()) => log::debug!("connection {:?} for {:?} to {:?} at {} closed",
                                               connection_id, from, game_id, addr),
                         Err(error) => log::debug!("error reading on connection {:?} for {:?} to {:?} at {}: {:?}",
@@ -485,7 +484,7 @@ impl Relay {
                     log::warn!("error connecting {:?} for {:?} to {:?} at {}: {:?}",
                                connection_id, from, game_id, addr, error),
             }
-        });
+        }));
     }
 
     fn forward_connect(&mut self, from: PeerId, to: PeerId, to_game_id: RemoteGameId, connect_message: RelayConnect) {

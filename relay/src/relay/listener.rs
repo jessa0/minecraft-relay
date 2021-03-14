@@ -1,4 +1,5 @@
 use super::connection::RelayConnection;
+use std::convert::TryInto;
 use std::error::Error;
 use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
@@ -38,6 +39,6 @@ impl RelayListener {
 
 fn handle_connection(stream: TcpStream) -> io::Result<RelayConnection> {
     let addr = stream.peer_addr()?;
-    let connection = RelayConnection::new(addr, stream)?;
+    let connection = RelayConnection::new(addr, stream.try_into()?)?;
     Ok(connection)
 }
