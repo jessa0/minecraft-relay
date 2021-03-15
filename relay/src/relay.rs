@@ -12,7 +12,7 @@ use async_net::AsyncToSocketAddrs;
 use bytes::Bytes;
 use core::fmt::Debug;
 use derive_more::{From, Into};
-use minecraft_relay_protocol::{relay_message, RelayConnect, RelayData, RelayGame, RelayMessage};
+use minecraft_relay_protocol::{relay_message, RelayCloseConnection, RelayConnect, RelayData, RelayGame, RelayMessage};
 use std::collections::{hash_map, HashMap};
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -193,7 +193,7 @@ impl Relay {
         }
     }
 
-    fn accept_game_connection(&mut self, game_id: LocalGameId, connection: GameConnection) {
+    fn accept_game_connection(&mut self, game_id: LocalGameId, mut connection: GameConnection) {
         let game = match self.games.map.get_mut(&game_id) {
             Some(Game::Remote(game)) => game,
             _ => {
@@ -218,38 +218,47 @@ impl Relay {
 
         log::debug!("accepted {:?} for {:?} from {} for {:?} on {:?}", connection_id, game_id, connection.peer_addr(), remote_game_id, peer_id);
 
+        let send_res = peer.handle.send(RelayMessage {
+            inner: Some(relay_message::Inner::Connect(RelayConnect {
+                game_id:       remote_game_id.0,
+                connection_id: connection_id.id,
+                hops:          0,
+            })),
+        });
+        if let Err(_) = send_res {
+            log::debug!("relay connection for {:?} for {:?} from {} for {:?} on {:?} closed",
+                        connection_id, game_id, connection.peer_addr(), remote_game_id, peer_id);
+            return;
+        }
+
         let peer_addr = connection.peer_addr();
         let peer_tx = peer.handle.clone();
-        std::thread::spawn(move || {
-            let send_res = peer_tx.send(RelayMessage {
-                inner: Some(relay_message::Inner::Connect(RelayConnect {
-                    game_id:       remote_game_id.0,
-                    connection_id: connection_id.id,
-                    hops:          0,
-                })),
-            });
-            if let Err(_) = send_res {
-                log::debug!("relay connection for {:?} for {:?} from {} for {:?} on {:?} closed",
-                            connection_id, game_id, peer_addr, remote_game_id, peer_id);
-                return;
-            }
-
-            let run_res = async_io::block_on(connection.run(|data| {
-                peer_tx.send(RelayMessage {
-                    inner: Some(relay_message::Inner::Data(RelayData {
-                        connection_id:    connection_id.id,
-                        connection_local: connection_id.local,
-                        data:             data.to_vec().into(),
-                    })),
-                })
-            }));
-            match run_res {
+        std::thread::spawn(move || async_io::block_on(async {
+            let run_res = async {
+                connection.wait_for_data().await?;
+                connection.run(|data| {
+                    peer_tx.send(RelayMessage {
+                        inner: Some(relay_message::Inner::Data(RelayData {
+                            connection_id:    connection_id.id,
+                            connection_local: connection_id.local,
+                            data:             data.to_vec().into(),
+                        })),
+                    })
+                }).await
+            };
+            match run_res.await {
                 Ok(()) => log::debug!("{:?} for {:?} from {} for {:?} on {:?} closed",
                                       connection_id, game_id, peer_addr, remote_game_id, peer_id),
                 Err(error) => log::debug!("error reading on {:?} for {:?}from {} for {:?} on {:?}: {:?}",
                                           connection_id, game_id, peer_addr, remote_game_id, peer_id, error),
             }
-        });
+            let _ = peer_tx.send(RelayMessage {
+                inner: Some(relay_message::Inner::CloseConnection(RelayCloseConnection {
+                    connection_id: connection_id.id,
+                    connection_local: connection_id.local,
+                })),
+            });
+        }));
     }
 
     fn accept_peer_connection(&mut self, connection: RelayConnection) {
@@ -323,6 +332,8 @@ impl Relay {
                 self.handle_connect(from, connect_message),
             relay_message::Inner::Data(data_message) =>
                 self.handle_data(from, data_message),
+            relay_message::Inner::CloseConnection(close_connection_message) =>
+                self.handle_close_connection(from, close_connection_message),
         }
     }
 
@@ -466,7 +477,7 @@ impl Relay {
                     if let Err(_) = tx.send(Message::AddGameConnection(from, connection_id, game_id, connection.handle())) {
                         return;
                     }
-                    let run_res = connection.run(move |data| peer_tx.send(RelayMessage {
+                    let run_res = connection.run(|data| peer_tx.send(RelayMessage {
                         inner: Some(relay_message::Inner::Data(RelayData {
                             connection_id:    connection_id.id,
                             connection_local: connection_id.local,
@@ -484,6 +495,12 @@ impl Relay {
                     log::warn!("error connecting {:?} for {:?} to {:?} at {}: {:?}",
                                connection_id, from, game_id, addr, error),
             }
+            let _ = peer_tx.send(RelayMessage {
+                inner: Some(relay_message::Inner::CloseConnection(RelayCloseConnection {
+                    connection_id: connection_id.id,
+                    connection_local: connection_id.local,
+                })),
+            });
         }));
     }
 
@@ -582,6 +599,18 @@ impl Relay {
                 })),
             }) {
                 self.remove_peer(&to);
+            }
+        }
+    }
+
+    fn handle_close_connection(&mut self, from: PeerId, close_connection_message: RelayCloseConnection) {
+        let connection_id = ConnectionId { id: close_connection_message.connection_id, local: close_connection_message.connection_local };
+        if let Some(from_peer) = self.peers.map.get_mut(&from) {
+            from_peer.local_connections.remove(&connection_id);
+            if let Some(relayed_connection) = from_peer.relayed_connections.remove(&connection_id) {
+                if let Some(to_peer) = self.peers.map.get_mut(&relayed_connection.peer) {
+                    to_peer.relayed_connections.remove(&relayed_connection.peer_connection_id);
+                }
             }
         }
     }

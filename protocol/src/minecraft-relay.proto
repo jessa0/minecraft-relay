@@ -8,6 +8,7 @@ message RelayMessage {
         RelayGame game = 1;
         RelayConnect connect = 2;
         RelayData data = 3;
+        RelayCloseConnection close_connection = 4;
     };
 }
 
@@ -27,4 +28,9 @@ message RelayData {
     uint64 connection_id = 1;
     bool connection_local = 2;
     bytes data = 3;
+}
+
+message RelayCloseConnection {
+    uint64 connection_id = 1;
+    bool connection_local = 2;
 }

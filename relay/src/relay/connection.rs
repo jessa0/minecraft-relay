@@ -70,6 +70,7 @@ impl RelayConnection {
     where E: Error + 'static,
           F: FnMut(RelayMessage) -> Result<(), E>,
     {
+        drop(self.tx);
         read_loop(self.stream.clone(), fun).or(write_loop(self.stream, self.rx)).await
     }
 }

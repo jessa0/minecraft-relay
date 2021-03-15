@@ -56,10 +56,20 @@ impl GameConnection {
         self.peer_addr
     }
 
+    pub async fn wait_for_data<E>(&mut self) -> Result<(), GameConnectionError<E>>
+    where E: Error + 'static,
+    {
+        if let Ok(data) = self.rx.recv().await {
+            self.stream.write_all(&data).await?;
+        }
+        Ok(())
+    }
+
     pub async fn run<E, F>(self, fun: F) -> Result<(), GameConnectionError<E>>
     where E: Error + 'static,
           F: FnMut(&[u8]) -> Result<(), E>,
     {
+        drop(self.tx);
         read_loop(self.stream.clone(), fun).or(write_loop(self.stream, self.rx)).await
     }
 }
