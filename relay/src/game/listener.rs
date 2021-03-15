@@ -41,7 +41,7 @@ impl GameListener {
 
     pub fn run<E, F>(self, mut fun: F) -> anyhow::Result<()>
     where anyhow::Error: From<E>,
-          F: FnMut(GameConnection) -> Result<(), E> + Send + 'static,
+          F: FnMut(GameConnection) -> Result<(), E>,
     {
         let Self { listener, mut keepalive, local_addr: _ } = self;
         let listener = Async::try_from(listener)?;

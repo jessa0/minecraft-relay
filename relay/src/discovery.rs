@@ -98,6 +98,10 @@ impl DiscoverySender {
         Ok(Self { socket })
     }
 
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
+
     pub fn send<'a>(&self, packet: &DiscoveryPacket<'a>) -> Result<(), DiscoverySendError> {
         let mut data_buf = [0; 1500];
         let mut data_buf_unused = &mut data_buf[..];

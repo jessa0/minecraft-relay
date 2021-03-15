@@ -13,19 +13,21 @@ use bytes::Bytes;
 use core::fmt::Debug;
 use derive_more::{From, Into};
 use minecraft_relay_protocol::{relay_message, RelayCloseConnection, RelayConnect, RelayData, RelayGame, RelayMessage};
-use std::collections::{hash_map, HashMap};
+use std::collections::{HashMap, HashSet, hash_map};
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::mpsc;
 use std::time::Duration;
 
 pub struct Relay {
-    peers:        IdMap<PeerId, Peer>,
-    games:        IdMap<LocalGameId, Game>,
-    local_games:  HashMap<SocketAddr, LocalGameId>,
-    discovery_tx: DiscoverySender,
-    tx:           RelayHandle,
-    rx:           mpsc::Receiver<Message>,
+    peers:          IdMap<PeerId, Peer>,
+    games:          IdMap<LocalGameId, Game>,
+    local_games:    HashMap<SocketAddr, LocalGameId>,
+    listen_ports:   HashSet<u16>,
+    discovery_port: u16,
+    discovery_tx:   DiscoverySender,
+    tx:             RelayHandle,
+    rx:             mpsc::Receiver<Message>,
 }
 
 #[derive(Clone)]
@@ -96,8 +98,9 @@ enum Message {
     AcceptGameConnection(LocalGameId, GameConnection),
     AddGameConnection(PeerId, ConnectionId, LocalGameId, GameConnectionHandle),
     AddPeer(RelayConnectionHandle, mpsc::Sender<PeerId>),
-    AddLocalGame(LocalGame, Bytes),
+    AddLocalGame(SocketAddr, u16, Bytes),
     Recv(PeerId, RelayMessage),
+    RemoveGameListener(LocalGameId),
     RemovePeer(PeerId),
 }
 
@@ -108,11 +111,14 @@ const GAME_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 impl Relay {
     pub fn new() -> io::Result<Self> {
         let (tx, rx) = mpsc::channel();
+        let discovery_tx = DiscoverySender::new()?;
         Ok(Self {
             peers: Default::default(),
             games: Default::default(),
             local_games: Default::default(),
-            discovery_tx: DiscoverySender::new()?,
+            listen_ports: Default::default(),
+            discovery_port: discovery_tx.local_addr()?.port(),
+            discovery_tx,
             tx: RelayHandle(tx),
             rx,
         })
@@ -183,10 +189,12 @@ impl Relay {
                     self.add_game_connection(peer_id, connection_id, game_id, tx),
                 Message::AddPeer(handle, reply_tx) =>
                     drop(reply_tx.send(self.peers.add(Peer::new(handle)))),
-                Message::AddLocalGame(local_game, motd) =>
-                    self.add_local_game(local_game, motd),
+                Message::AddLocalGame(from, port, motd) =>
+                    self.add_local_game(from, port, motd),
                 Message::Recv(from, message) =>
                     self.handle_peer_message(from, message),
+                Message::RemoveGameListener(game_id) =>
+                    self.remove_game_listener(&game_id),
                 Message::RemovePeer(peer_id) =>
                     self.remove_peer(&peer_id),
             }
@@ -297,11 +305,15 @@ impl Relay {
         }
     }
 
-    fn add_local_game(&mut self, local_game: LocalGame, motd: Bytes) {
-        let addr = local_game.addr;
+    fn add_local_game(&mut self, from: SocketAddr, port: u16, motd: Bytes) {
+        let mut addr = from;
+        addr.set_port(port);
+        if from.port() == self.discovery_port && self.listen_ports.contains(&port) {
+            return;
+        }
         let games = &mut self.games;
         let game_id = self.local_games.entry(addr).or_insert_with(|| {
-            let game_id = games.add(Game::Local(local_game));
+            let game_id = games.add(Game::Local(LocalGame { addr }));
             log::debug!("adding {:?} from {}", game_id, addr);
             game_id
         });
@@ -372,6 +384,7 @@ impl Relay {
 
         if let Some(listener) = &mut remote_game.listener {
             if let Err(_) = listener.handle.keepalive() {
+                self.listen_ports.remove(&listener.addr.port());
                 remote_game.listener = None;
             }
         }
@@ -380,10 +393,11 @@ impl Relay {
             remote_game.listener = match GameListener::new() {
                 Ok(listener) => {
                     let listener_addr = listener.local_addr();
+                    self.listen_ports.insert(listener_addr.port());
                     let listener_handle = listener.handle();
                     let tx = self.tx.clone();
                     std::thread::spawn(move || {
-                        match listener.run(move |connection| tx.send(Message::AcceptGameConnection(local_game_id, connection))) {
+                        match listener.run(|connection| tx.send(Message::AcceptGameConnection(local_game_id, connection))) {
                             Ok(()) =>
                                 log::info!("listener for {:?} on {} for {:?} on {:?} closed",
                                            local_game_id, listener_addr, remote_game_id, from),
@@ -391,6 +405,7 @@ impl Relay {
                                 log::info!("error listening for {:?} on {} for {:?} on {:?}: {:?}",
                                            local_game_id, listener_addr, remote_game_id, from, error),
                         }
+                        let _ = tx.send(Message::RemoveGameListener(local_game_id));
                     });
                     log::info!("started listener for {:?} on {} for {:?} on {:?}",
                                local_game_id, listener_addr, remote_game_id, from);
@@ -615,17 +630,47 @@ impl Relay {
         }
     }
 
+    fn remove_game_listener(&mut self, game_id: &LocalGameId) {
+        let remote_game = match self.games.map.get_mut(game_id) {
+            Some(Game::Remote(remote_game)) => remote_game,
+            _ => return,
+        };
+        if let Some(listener) = &mut remote_game.listener {
+            if let Err(_) = listener.handle.keepalive() {
+                self.listen_ports.remove(&listener.addr.port());
+                remote_game.listener = None;
+            }
+        }
+    }
+
     fn remove_peer(&mut self, peer_id: &PeerId) {
         let peer = match self.peers.map.get(peer_id) {
             Some(peer) => peer,
             None => return,
         };
 
+        let mut removed_games = Vec::new();
         for (_, game) in &peer.games {
-            self.games.map.remove(&game.local_game_id);
+            if let Some(game) = self.games.map.remove(&game.local_game_id) {
+                removed_games.push(game);
+            }
+        }
+        for game in removed_games {
+            self.cleanup_removed_game(game);
         }
         if self.games.map.len() < self.games.map.capacity() / 4 {
             self.games.map.shrink_to_fit();
+        }
+    }
+
+    fn cleanup_removed_game(&mut self, game: Game) {
+        match game {
+            Game::Remote(RemoteGame { peer_id: _, remote_game_id: _, listener }) => {
+                if let Some(listener) = listener {
+                    self.listen_ports.remove(&listener.addr.port());
+                }
+            }
+            Game::Local(LocalGame { addr: _ }) => (),
         }
     }
 }
@@ -635,8 +680,8 @@ impl RelayHandle {
         self.0.send(message).map_err(|_| RelayClosedError)
     }
 
-    pub fn add_local_game(&self, addr: SocketAddr, motd: Bytes) -> Result<(), RelayClosedError> {
-        self.send(Message::AddLocalGame(LocalGame { addr }, motd))
+    pub fn add_local_game(&self, from: SocketAddr, port: u16, motd: Bytes) -> Result<(), RelayClosedError> {
+        self.send(Message::AddLocalGame(from, port, motd))
     }
 }
 
