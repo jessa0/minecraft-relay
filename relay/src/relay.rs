@@ -249,7 +249,7 @@ impl Relay {
             match run_res.await {
                 Ok(()) => log::debug!("{:?} for {:?} from {} for {:?} on {:?} closed",
                                       connection_id, game_id, peer_addr, remote_game_id, peer_id),
-                Err(error) => log::debug!("error reading on {:?} for {:?}from {} for {:?} on {:?}: {:?}",
+                Err(error) => log::debug!("error reading on {:?} for {:?} from {} for {:?} on {:?}: {:?}",
                                           connection_id, game_id, peer_addr, remote_game_id, peer_id, error),
             }
             let _ = peer_tx.send(RelayMessage {
@@ -485,7 +485,7 @@ impl Relay {
                         })),
                     }));
                     match run_res.await {
-                        Ok(()) => log::debug!("connection {:?} for {:?} to {:?} at {} closed",
+                        Ok(()) => log::debug!("{:?} for {:?} to {:?} at {} closed",
                                               connection_id, from, game_id, addr),
                         Err(error) => log::debug!("error reading on connection {:?} for {:?} to {:?} at {}: {:?}",
                                                   connection_id, from, game_id, addr, error),
