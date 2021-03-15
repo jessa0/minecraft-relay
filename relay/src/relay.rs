@@ -644,7 +644,7 @@ impl Relay {
     }
 
     fn remove_peer(&mut self, peer_id: &PeerId) {
-        let peer = match self.peers.map.get(peer_id) {
+        let peer = match self.peers.map.remove(peer_id) {
             Some(peer) => peer,
             None => return,
         };
