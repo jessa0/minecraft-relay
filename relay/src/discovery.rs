@@ -3,6 +3,8 @@ use core::str;
 use nom::IResult;
 use socket2::Socket;
 use std::collections::HashMap;
+use std::convert::Infallible;
+use std::error::Error;
 use std::io;
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
@@ -19,6 +21,14 @@ pub struct DiscoverySender {
 pub struct DiscoveryPacket<'a> {
     pub port: u16,
     pub motd: &'a [u8],
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum DiscoveryListenerError<T: Error + 'static> {
+    #[error("io error: {0}")]
+    Io(#[from] io::Error),
+    #[error(transparent)]
+    Returned(T),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -62,12 +72,15 @@ impl DiscoveryListener {
         Ok(Self { socket: socket.into() })
     }
 
-    pub fn run<F: FnMut(SocketAddr, DiscoveryPacket)>(self, mut callback: F) -> io::Result<()> {
+    pub fn run<E, F>(&self, mut callback: F) -> Result<Infallible, DiscoveryListenerError<E>>
+    where E: Error + 'static,
+          F: FnMut(SocketAddr, DiscoveryPacket) -> Result<(), E>,
+    {
         let mut buf = [0; MAX_PACKET_SIZE];
         loop {
             let (len, from) = self.socket.recv_from(&mut buf)?;
             match DiscoveryPacket::parse(&buf[..len]) {
-                Ok(packet) => callback(from, packet),
+                Ok(packet) => callback(from, packet).map_err(DiscoveryListenerError::Returned)?,
                 Err(error) => log::warn!("error parsing discovery packet from {}: {:?}", &from, error),
             }
         }
