@@ -16,7 +16,8 @@ use minecraft_relay_protocol::{relay_message, RelayCloseConnection, RelayConnect
 use std::collections::{HashMap, HashSet, hash_map};
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 pub struct Relay {
@@ -32,6 +33,9 @@ pub struct Relay {
 
 #[derive(Clone)]
 pub struct RelayHandle(mpsc::Sender<Message>);
+
+#[derive(Clone)]
+pub struct RelayConnectHandle(Arc<AtomicBool>);
 
 #[derive(Debug, thiserror::Error)]
 #[error("relay closed")]
@@ -144,38 +148,10 @@ impl Relay {
         Ok(())
     }
 
-    pub fn connect<A>(&self, addr: A)
+    pub fn connect<A>(&self, addr: A) -> RelayConnectHandle
     where A: AsyncToSocketAddrs + Clone + Debug + Send + 'static,
     {
-        let tx = self.tx.clone();
-        std::thread::spawn(move || async_io::block_on(async {
-            loop {
-                let reconnect_time = Timer::after(RELAY_CONNECT_TIMEOUT);
-                match RelayConnection::connect(addr.clone(), RELAY_CONNECT_TIMEOUT).await {
-                    Ok(connection) => {
-                        let addr = connection.peer_addr();
-                        log::info!("connected to relay {}", addr);
-                        let (reply_tx, reply_rx) = mpsc::channel();
-                        if let Err(_) = tx.send(Message::AddPeer(connection.handle(), reply_tx)) {
-                            return;
-                        }
-                        let id = match reply_rx.recv() {
-                            Ok(id) => id,
-                            Err(_) => break,
-                        };
-                        match connection.run(|message| tx.send(Message::Recv(id, message))).await {
-                            Ok(()) => log::debug!("relay connection to {} closed", addr),
-                            Err(error) => log::info!("error reading from relay connection {}: {}", addr, error),
-                        }
-                        if let Err(_) = tx.send(Message::RemovePeer(id)) {
-                            return;
-                        }
-                    }
-                    Err(error) => log::info!("error connecting to relay {:?}: {}", addr, error),
-                }
-                reconnect_time.await;
-            }
-        }));
+        self.tx.connect(addr)
     }
 
     pub fn run(&mut self) {
@@ -680,8 +656,57 @@ impl RelayHandle {
         self.0.send(message).map_err(|_| RelayClosedError)
     }
 
+    pub fn connect<A>(&self, addr: A) -> RelayConnectHandle
+    where A: AsyncToSocketAddrs + Clone + Debug + Send + 'static,
+    {
+        let tx = self.clone();
+        let handle = RelayConnectHandle(Default::default());
+        let handle_2 = handle.clone();
+        std::thread::spawn(move || async_io::block_on(async {
+            while !handle.0.load(Ordering::Acquire) {
+                let reconnect_time = Timer::after(RELAY_CONNECT_TIMEOUT);
+                match RelayConnection::connect(addr.clone(), RELAY_CONNECT_TIMEOUT).await {
+                    Ok(connection) => {
+                        let addr = connection.peer_addr();
+                        log::info!("connected to relay {}", addr);
+                        let (reply_tx, reply_rx) = mpsc::channel();
+                        if let Err(_) = tx.send(Message::AddPeer(connection.handle(), reply_tx)) {
+                            break;
+                        }
+                        let id = match reply_rx.recv() {
+                            Ok(id) => id,
+                            Err(_) => break,
+                        };
+                        match connection.run(|message| tx.send(Message::Recv(id, message))).await {
+                            Ok(()) => log::debug!("relay connection to {} closed", addr),
+                            Err(error) => log::info!("error reading from relay connection {}: {}", addr, error),
+                        }
+                        if let Err(_) = tx.send(Message::RemovePeer(id)) {
+                            break;
+                        }
+                        handle.0.store(false, Ordering::Release);
+                    }
+                    Err(error) => {
+                        log::info!("error connecting to relay {:?}: {}", addr, error);
+                        if error.kind() == io::ErrorKind::InvalidInput {
+                            break;
+                        }
+                    }
+                }
+                reconnect_time.await;
+            }
+        }));
+        handle_2
+    }
+
     pub fn add_local_game(&self, from: SocketAddr, port: u16, motd: Bytes) -> Result<(), RelayClosedError> {
         self.send(Message::AddLocalGame(from, port, motd))
+    }
+}
+
+impl RelayConnectHandle {
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
     }
 }
 
