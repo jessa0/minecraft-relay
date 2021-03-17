@@ -1,0 +1,78 @@
+name: release
+on:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'
+defaults:
+  run:
+    shell: bash
+jobs:
+  build-release:
+    name: build-release
+    runs-on: ${{ matrix.os }}
+    env:
+      package_name: minecraft-relay
+    strategy:
+      matrix:
+        platform: [ubuntu18, macos, windows]
+        include:
+          - platform: ubuntu18
+            os:       ubuntu-18.04
+            target:   x86_64-unknown-linux-gnu
+
+          - platform: macos
+            os:       macos-latest
+            target:   x86_64-apple-darwin
+
+          - platform: windows
+            os:       windows-2019
+            target:   x86_64-pc-windows-msvc
+    steps:
+      - name: cargo install cargo-strip
+        if:   matrix.platform != 'windows'
+        run:  cargo install cargo-strip --verbose
+
+      - name: checkout
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 1
+
+      - name: discover package version
+        run: |
+          echo "package_version=$(cargo pkgid --package ${{ env.package_name }} | cut -d\# -f2 | cut -d: -f2)" >> "$GITHUB_ENV"
+
+      - name: cargo build --release
+        run:  cargo build --release --verbose --target=${{ matrix.target }}
+
+      - name: cargo strip
+        if:   matrix.platform != 'windows'
+        run:  cargo strip --target=${{ matrix.target }}
+
+      - name: assemble archive
+        run: |
+          archive_name=${{ env.package_name }}-$package_version-${{ matrix.platform }}
+          mkdir -p "$archive_name/"
+          cp README.md LICENSE "$archive_name/"
+          if [ "${{ matrix.os }}" = "windows-2019" ]; then
+            cp "target/${{ matrix.target }}/release/${{ env.package_name }}.exe" "$archive_name/"
+            archive_filename="$archive_name.zip"
+            7z a "$archive_filename" "$archive_name/"
+          else
+            cp "target/${{ matrix.target }}/release/${{ env.package_name }}" "$archive_name/"
+            archive_filename="$archive_name.tar.gz"
+            tar -czf "$archive_filename" "$archive_name/"
+          fi
+          echo "archive_filename=$archive_filename" >> "$GITHUB_ENV"
+
+      - name: upload artifacts
+        uses: actions/upload-artifact@v1
+        with:
+          name: ${{ env.archive_filename }}
+          path: ${{ env.archive_filename }}
+
+      - name: upload release archive
+        run: |
+          gh release create "${{ env.package_version }}" || true
+          gh release upload --clobber "${{ env.package_version }}" "${{ env.archive_filename }}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
