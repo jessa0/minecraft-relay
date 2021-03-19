@@ -17,5 +17,6 @@ log = "0.4"
 minecraft-relay-protocol = { path = "../protocol" }
 nom = "6.1"
 prost = "0.7"
+snow = "0.7"
 socket2 = "0.3"
 thiserror = "1.0"

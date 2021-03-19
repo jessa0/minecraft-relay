@@ -1,7 +1,7 @@
 mod connection;
 mod listener;
 
-pub use self::connection::{RelayConnection, RelayConnectionHandle};
+pub use self::connection::{RelayConnectError, RelayConnection, RelayConnectionHandle};
 pub use self::listener::RelayListener;
 
 use crate::discovery::{DiscoveryPacket, DiscoverySender};
@@ -688,8 +688,10 @@ impl RelayHandle {
                     }
                     Err(error) => {
                         log::info!("error connecting to relay {:?}: {}", addr, error);
-                        if error.kind() == io::ErrorKind::InvalidInput {
-                            break;
+                        match error {
+                            RelayConnectError::Io(io_error) if io_error.kind() == io::ErrorKind::InvalidInput =>
+                                break,
+                            _ => (),
                         }
                     }
                 }
