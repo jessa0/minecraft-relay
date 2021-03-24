@@ -1,7 +1,9 @@
 mod connection;
 mod listener;
 
-pub use self::connection::{RelayConnectError, RelayConnection, RelayConnectionHandle};
+pub use self::connection::{
+    RelayConnectError, RelayConnection, RelayConnectionError, RelayConnectionHandle, EstablishedRelayConnection, RelayKeypair, RelayStaticKey
+};
 pub use self::listener::RelayListener;
 
 use crate::discovery::{DiscoveryPacket, DiscoverySender};
@@ -10,12 +12,15 @@ use crate::id_map::IdMap;
 use async_io::Timer;
 use async_net::AsyncToSocketAddrs;
 use bytes::Bytes;
+use core::cell::RefCell;
+use core::convert::Infallible;
 use core::fmt::Debug;
 use derive_more::{From, Into};
+use futures_lite::prelude::*;
 use minecraft_relay_protocol::{relay_message, RelayCloseConnection, RelayConnect, RelayData, RelayGame, RelayMessage};
 use std::collections::{HashMap, HashSet, hash_map};
 use std::io;
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
@@ -50,6 +55,13 @@ struct Peer {
     local_connections:   HashMap<ConnectionId, LocalConnection>,
     relayed_connections: HashMap<ConnectionId, RelayedConnection>,
     next_connection_id:  ConnectionId,
+}
+
+
+struct PeerConnection {
+    peer_id:    PeerId,
+    relay:      RelayHandle,
+    connection: EstablishedRelayConnection,
 }
 
 struct RelayedGame {
@@ -98,7 +110,6 @@ struct RemoteGameListener {
 }
 
 enum Message {
-    AcceptPeer(RelayConnection),
     AcceptGameConnection(LocalGameId, GameConnection),
     AddGameConnection(PeerId, ConnectionId, LocalGameId, GameConnectionHandle),
     AddPeer(RelayConnectionHandle, mpsc::Sender<PeerId>),
@@ -132,26 +143,10 @@ impl Relay {
         self.tx.clone()
     }
 
-    pub fn listen<A: ToSocketAddrs>(&self, addr: A) -> io::Result<()> {
-        let tx = self.tx.clone();
-        let listener = RelayListener::bind(addr)?;
-        log::info!("relay listening on {}", listener.local_addr()?);
-        std::thread::spawn(move || {
-            loop {
-                match listener.run(|connection| tx.send(Message::AcceptPeer(connection))) {
-                    Ok(()) => (),
-                    Err(error) => log::warn!("error listening for relay connections: {:?}", error),
-                }
-                std::thread::sleep(Duration::from_secs(1));
-            }
-        });
-        Ok(())
-    }
-
-    pub fn connect<A>(&self, addr: A) -> RelayConnectHandle
+    pub fn connect<A>(&self, addr: A, keypair: RelayKeypair) -> RelayConnectHandle
     where A: AsyncToSocketAddrs + Clone + Debug + Send + 'static,
     {
-        self.tx.connect(addr)
+        self.tx.connect(addr, keypair)
     }
 
     pub fn run(&mut self) {
@@ -159,8 +154,6 @@ impl Relay {
             match message {
                 Message::AcceptGameConnection(game_id, connection) =>
                     self.accept_game_connection(game_id, connection),
-                Message::AcceptPeer(connection) =>
-                    self.accept_peer_connection(connection),
                 Message::AddGameConnection(peer_id, connection_id, game_id, tx) =>
                     self.add_game_connection(peer_id, connection_id, game_id, tx),
                 Message::AddPeer(handle, reply_tx) =>
@@ -242,20 +235,6 @@ impl Relay {
                     connection_local: connection_id.local,
                 })),
             });
-        }));
-    }
-
-    fn accept_peer_connection(&mut self, connection: RelayConnection) {
-        let peer_id = self.peers.add(Peer::new(connection.handle()));
-        log::info!("accepted relay connection from {} for {:?}", connection.peer_addr(), peer_id);
-
-        let tx = self.tx.clone();
-        std::thread::spawn(move || async_io::block_on(async {
-            let addr = connection.peer_addr();
-            match connection.run(|message| tx.send(Message::Recv(peer_id, message))).await {
-                Ok(()) => log::debug!("relay connection from {} for {:?} closed", addr, peer_id),
-                Err(error) => log::info!("error reading from relay connection from {} for {:?}: {}", addr, peer_id, error),
-            }
         }));
     }
 
@@ -651,12 +630,87 @@ impl Relay {
     }
 }
 
+//
+// RelayHandle impls
+//
+
 impl RelayHandle {
     fn send(&self, message: Message) -> Result<(), RelayClosedError> {
         self.0.send(message).map_err(|_| RelayClosedError)
     }
 
-    pub fn connect<A>(&self, addr: A) -> RelayConnectHandle
+    pub async fn listen<F>(&self, listener: RelayListener, mut fun: F) -> Infallible
+    where F: FnMut(&mut EstablishedRelayConnection) -> bool,
+    {
+        let relay = self.clone();
+        let (tx, rx) = async_channel::unbounded();
+        let trusted_peers: RefCell<HashSet<RelayStaticKey>> = Default::default();
+        let listen_loop = async {
+            loop {
+                let listen = listener.run(|connection| -> Result<(), Infallible> {
+                    let relay = relay.clone();
+                    let tx = tx.clone();
+                    let trusted_peers = trusted_peers.borrow().clone();
+                    std::thread::spawn(move || async_io::block_on(async {
+                        relay.accept(connection, move |connection| {
+                            if trusted_peers.contains(&connection.connection.peer_static()) {
+                                return Some(connection);
+                            }
+                            let (reply_tx, reply_rx) = mpsc::channel();
+                            tx.try_send((connection, reply_tx)).ok()?;
+                            reply_rx.recv().unwrap_or(None)
+                        }).await
+                    }));
+                    Ok(())
+                });
+                match listen.await {
+                    Ok(never) => match never {},
+                    Err(error) => log::warn!("error listening for relay connections: {:?}", error),
+                }
+                async_io::Timer::after(Duration::from_secs(1)).await;
+            }
+        };
+        let accept_loop = async {
+            loop {
+                let (mut connection, reply_tx) = rx.recv().await.expect("tx has not been dropped");
+                let reply = fun(&mut connection.connection).then(|| {
+                    trusted_peers.borrow_mut().insert(connection.connection.peer_static());
+                    connection
+                });
+                let _ = reply_tx.send(reply);
+            };
+        };
+        listen_loop.or(accept_loop).await
+    }
+
+    async fn accept<F>(&self, connection: RelayConnection, fun: F)
+    where F: FnOnce(PeerConnection) -> Option<PeerConnection>
+    {
+        let addr = connection.peer_addr();
+        let connection = match PeerConnection::new(self, connection).await {
+            Ok(connection) => connection,
+            Err(error) => {
+                log::info!("error accepting relay connection from {}: {}", addr, error);
+                return;
+            }
+        };
+        let peer_id = connection.peer_id;
+        let peer_static = connection.connection.peer_static();
+        let mut connection = match fun(connection) {
+            Some(connection) => connection,
+            None => {
+                log::info!("rejected relay connection from {} ({}) for {:?}", addr, peer_static, peer_id);
+                return;
+            }
+        };
+        log::info!("accepted relay connection from {} ({}) for {:?}", addr, peer_static, peer_id);
+        match connection.run().await {
+            Ok(()) => log::debug!("relay connection from {} for {:?} closed", addr, peer_id),
+            Err(error) => log::info!("error reading from relay connection from {} for {:?}: {}", addr, peer_id, error),
+        }
+    }
+
+    pub fn connect<A>(&self, addr: A, keypair: RelayKeypair) -> RelayConnectHandle
     where A: AsyncToSocketAddrs + Clone + Debug + Send + 'static,
     {
         let tx = self.clone();
@@ -665,24 +719,23 @@ impl RelayHandle {
         std::thread::spawn(move || async_io::block_on(async {
             while !handle.0.load(Ordering::Acquire) {
                 let reconnect_time = Timer::after(RELAY_CONNECT_TIMEOUT);
-                match RelayConnection::connect(addr.clone(), RELAY_CONNECT_TIMEOUT).await {
+                match RelayConnection::connect(addr.clone(), &keypair, RELAY_CONNECT_TIMEOUT).await {
                     Ok(connection) => {
                         let addr = connection.peer_addr();
-                        log::info!("connected to relay {}", addr);
-                        let (reply_tx, reply_rx) = mpsc::channel();
-                        if let Err(_) = tx.send(Message::AddPeer(connection.handle(), reply_tx)) {
-                            break;
-                        }
-                        let id = match reply_rx.recv() {
-                            Ok(id) => id,
-                            Err(_) => break,
+                        let mut connection = match PeerConnection::new(&tx, connection).await {
+                            Ok(connection) => connection,
+                            Err(error) => {
+                                log::info!("error connecting to relay {}: {}", addr, error);
+                                return;
+                            }
                         };
-                        match connection.run(|message| tx.send(Message::Recv(id, message))).await {
+                        log::info!("connected to relay {} ({})", addr, connection.connection.peer_static());
+                        match connection.run().await {
                             Ok(()) => log::debug!("relay connection to {} closed", addr),
-                            Err(error) => log::info!("error reading from relay connection {}: {}", addr, error),
-                        }
-                        if let Err(_) = tx.send(Message::RemovePeer(id)) {
-                            break;
+                            Err(error) => {
+                                log::info!("error on relay connection {}: {:?}", addr, error);
+                                break;
+                            }
                         }
                         handle.0.store(false, Ordering::Release);
                     }
@@ -706,11 +759,19 @@ impl RelayHandle {
     }
 }
 
+//
+// RelayConnectHandle impls
+//
+
 impl RelayConnectHandle {
     pub fn cancel(&self) {
         self.0.store(true, Ordering::Release);
     }
 }
+
+//
+// Peer impls
+//
 
 impl Peer {
     pub fn new(handle: RelayConnectionHandle) -> Self {
@@ -721,5 +782,31 @@ impl Peer {
             relayed_connections: Default::default(),
             next_connection_id: Default::default(),
         }
+    }
+}
+
+//
+// PeerConnection impls
+//
+
+impl PeerConnection {
+    pub async fn new(relay: &RelayHandle, connection: RelayConnection) -> Result<PeerConnection, anyhow::Error> {
+        let handle = connection.handle();
+        let connection = connection.handshake().await?;
+        let (reply_tx, reply_rx) = mpsc::channel();
+        relay.send(Message::AddPeer(handle, reply_tx))?;
+        let peer_id = reply_rx.recv().map_err(|_| RelayClosedError)?;
+        Ok(PeerConnection { peer_id, relay: relay.clone(), connection })
+    }
+
+    pub async fn run(&mut self) -> Result<(), RelayConnectionError<RelayClosedError>> {
+        let Self { peer_id, relay, connection } = self;
+        connection.run(|message| relay.send(Message::Recv(*peer_id, message))).await
+    }
+}
+
+impl Drop for PeerConnection {
+    fn drop(&mut self) {
+        let _ignore = self.relay.send(Message::RemovePeer(self.peer_id));
     }
 }
