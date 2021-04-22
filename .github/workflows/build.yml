@@ -1,8 +1,5 @@
 name: build
-on:
-  push:
-    branches:
-      - '*'
+on: [push]
 defaults:
   run:
     shell: bash
