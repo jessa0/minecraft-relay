@@ -15,7 +15,7 @@ use bytes::Bytes;
 use core::cell::RefCell;
 use core::convert::Infallible;
 use core::fmt::Debug;
-use derive_more::{From, Into};
+use derive_more::{Display, From, Into};
 use futures_lite::prelude::*;
 use minecraft_relay_protocol::{relay_message, RelayCloseConnection, RelayConnect, RelayData, RelayGame, RelayMessage};
 use std::collections::{HashMap, HashSet, hash_map};
@@ -26,7 +26,7 @@ use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 pub struct Relay {
-    peers:          IdMap<PeerId, Peer>,
+    peers:          HashMap<PeerId, Peer>,
     games:          IdMap<LocalGameId, Game>,
     local_games:    HashMap<SocketAddr, LocalGameId>,
     listen_ports:   HashSet<u16>,
@@ -46,8 +46,8 @@ pub struct RelayConnectHandle(Arc<AtomicBool>);
 #[error("relay closed")]
 pub struct RelayClosedError;
 
-#[derive(Clone, Copy, Debug, Default, From, Hash, Eq, Into, PartialEq, PartialOrd, Ord)]
-struct PeerId(u64);
+#[derive(Clone, Copy, Display, From, Hash, Eq, Into, PartialEq, PartialOrd, Ord)]
+struct PeerId(RelayStaticKey);
 
 struct Peer {
     handle:              RelayConnectionHandle,
@@ -112,7 +112,7 @@ struct RemoteGameListener {
 enum Message {
     AcceptGameConnection(LocalGameId, GameConnection),
     AddGameConnection(PeerId, ConnectionId, LocalGameId, GameConnectionHandle),
-    AddPeer(RelayConnectionHandle, mpsc::Sender<PeerId>),
+    AddPeer(PeerId, RelayConnectionHandle),
     AddLocalGame(SocketAddr, u16, Bytes),
     Recv(PeerId, RelayMessage),
     RemoveGameListener(LocalGameId),
@@ -156,8 +156,8 @@ impl Relay {
                     self.accept_game_connection(game_id, connection),
                 Message::AddGameConnection(peer_id, connection_id, game_id, tx) =>
                     self.add_game_connection(peer_id, connection_id, game_id, tx),
-                Message::AddPeer(handle, reply_tx) =>
-                    drop(reply_tx.send(self.peers.add(Peer::new(handle)))),
+                Message::AddPeer(peer_id, handle) =>
+                    self.add_peer(peer_id, handle),
                 Message::AddLocalGame(from, port, motd) =>
                     self.add_local_game(from, port, motd),
                 Message::Recv(from, message) =>
@@ -181,7 +181,7 @@ impl Relay {
         let remote_game_id = game.remote_game_id;
 
         let peer_id = game.peer_id;
-        let peer = match self.peers.map.get_mut(&peer_id) {
+        let peer = match self.peers.get_mut(&peer_id) {
             Some(peer) => peer,
             None => {
                 log::debug!("dropping accepted connection for {:?} on unknown {:?}", game_id, peer_id);
@@ -239,7 +239,7 @@ impl Relay {
     }
 
     fn add_game_connection(&mut self, from: PeerId, connection_id: ConnectionId, game_id: LocalGameId, tx: GameConnectionHandle) {
-        let peer = match self.peers.map.get_mut(&from) {
+        let peer = match self.peers.get_mut(&from) {
             Some(peer) => peer,
             None => {
                 log::debug!("dropping new {:?} for {:?} on unknown {:?}", connection_id, game_id, from);
@@ -260,6 +260,10 @@ impl Relay {
         }
     }
 
+    fn add_peer(&mut self, peer_id: PeerId, handle: RelayConnectionHandle) {
+        self.peers.insert(peer_id, Peer::new(handle));
+    }
+
     fn add_local_game(&mut self, from: SocketAddr, port: u16, motd: Bytes) {
         let mut addr = from;
         addr.set_port(port);
@@ -274,7 +278,7 @@ impl Relay {
         });
         log::debug!("forwarding advertisement for {:?}", game_id);
         let mut errors = Vec::new();
-        for (peer_id, peer) in &self.peers.map {
+        for (peer_id, peer) in &self.peers {
             if let Err(_) = peer.handle.send(RelayMessage {
                 inner: Some(relay_message::Inner::Game(RelayGame {
                     id:   game_id.0,
@@ -318,7 +322,7 @@ impl Relay {
     }
 
     fn add_game(&mut self, from: PeerId, game_message: &RelayGame) -> Option<&mut RelayedGame> {
-        let peer = self.peers.map.get_mut(&from)?;
+        let peer = self.peers.get_mut(&from)?;
         let remote_game_id = RemoteGameId(game_message.id);
         let games = &mut self.games;
         let relayed_game_entry = peer.games.entry(remote_game_id).or_insert_with(|| RelayedGame {
@@ -395,11 +399,11 @@ impl Relay {
             log::debug!("not forwarding {:?} from {:?} after {} forwarding hops", game_id, from, game_message.hops);
             return;
         }
-        if self.peers.map.len() > 1 {
-            log::debug!("forwarding {:?} from {:?} to {} peers", game_id, from, self.peers.map.len() - 1);
+        if self.peers.len() > 1 {
+            log::debug!("forwarding {:?} from {:?} to {} peers", game_id, from, self.peers.len() - 1);
         }
         let mut errors = Vec::new();
-        for (peer_id, peer) in &self.peers.map {
+        for (peer_id, peer) in &self.peers {
             if *peer_id != from {
                 if let Err(_) = peer.handle.send(RelayMessage {
                     inner: Some(relay_message::Inner::Game(RelayGame {
@@ -431,7 +435,7 @@ impl Relay {
     }
 
     fn connect_local(&mut self, from: PeerId, game_id: LocalGameId, connection_id: ConnectionId, addr: SocketAddr) {
-        let peer = match self.peers.map.get_mut(&from) {
+        let peer = match self.peers.get_mut(&from) {
             Some(peer) => peer,
             None => {
                 log::debug!("not connecting for unknown {:?} to {:?}", from, game_id);
@@ -480,7 +484,7 @@ impl Relay {
             return;
         }
 
-        let from_peer = match self.peers.map.get(&from) {
+        let from_peer = match self.peers.get(&from) {
             Some(from_peer) => from_peer,
             None => return,
         };
@@ -491,7 +495,7 @@ impl Relay {
             return;
         }
 
-        let to_peer = match self.peers.map.get_mut(&to) {
+        let to_peer = match self.peers.get_mut(&to) {
             Some(to_peer) => to_peer,
             None => return,
         };
@@ -517,7 +521,7 @@ impl Relay {
             return;
         }
 
-        let from_peer = match self.peers.map.get_mut(&from) {
+        let from_peer = match self.peers.get_mut(&from) {
             Some(from_peer) => from_peer,
             None => unreachable!(),
         };
@@ -530,7 +534,7 @@ impl Relay {
     fn handle_data(&mut self, from: PeerId, data_message: RelayData) {
         let from_connection_id = ConnectionId { id: data_message.connection_id, local: data_message.connection_local };
 
-        let from_peer = match self.peers.map.get_mut(&from) {
+        let from_peer = match self.peers.get_mut(&from) {
             Some(from_peer) => from_peer,
             None => {
                 log::debug!("dropping data packet for {:?} from unknown {:?}", from_connection_id, from);
@@ -552,7 +556,7 @@ impl Relay {
             };
 
             let &RelayedConnection { peer: to, peer_connection_id: to_connection_id } = from_connection;
-            let to_peer = match self.peers.map.get(&to) {
+            let to_peer = match self.peers.get(&to) {
                 Some(to_peer) => to_peer,
                 None => {
                     log::debug!("dropping data packet for {:?} from {:?} to {:?} on unknown {:?}",
@@ -575,10 +579,10 @@ impl Relay {
 
     fn handle_close_connection(&mut self, from: PeerId, close_connection_message: RelayCloseConnection) {
         let connection_id = ConnectionId { id: close_connection_message.connection_id, local: close_connection_message.connection_local };
-        if let Some(from_peer) = self.peers.map.get_mut(&from) {
+        if let Some(from_peer) = self.peers.get_mut(&from) {
             from_peer.local_connections.remove(&connection_id);
             if let Some(relayed_connection) = from_peer.relayed_connections.remove(&connection_id) {
-                if let Some(to_peer) = self.peers.map.get_mut(&relayed_connection.peer) {
+                if let Some(to_peer) = self.peers.get_mut(&relayed_connection.peer) {
                     to_peer.relayed_connections.remove(&relayed_connection.peer_connection_id);
                 }
             }
@@ -599,7 +603,7 @@ impl Relay {
     }
 
     fn remove_peer(&mut self, peer_id: &PeerId) {
-        let peer = match self.peers.map.remove(peer_id) {
+        let peer = match self.peers.remove(peer_id) {
             Some(peer) => peer,
             None => return,
         };
@@ -770,6 +774,18 @@ impl RelayConnectHandle {
 }
 
 //
+// PeerId impls
+//
+
+impl Debug for PeerId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("PeerId")
+         .field(&format_args!("{}", &self.0))
+         .finish()
+    }
+}
+
+//
 // Peer impls
 //
 
@@ -793,9 +809,8 @@ impl PeerConnection {
     pub async fn new(relay: &RelayHandle, connection: RelayConnection) -> Result<PeerConnection, anyhow::Error> {
         let handle = connection.handle();
         let connection = connection.handshake().await?;
-        let (reply_tx, reply_rx) = mpsc::channel();
-        relay.send(Message::AddPeer(handle, reply_tx))?;
-        let peer_id = reply_rx.recv().map_err(|_| RelayClosedError)?;
+        let peer_id = PeerId(connection.peer_static());
+        relay.send(Message::AddPeer(peer_id.clone(), handle))?;
         Ok(PeerConnection { peer_id, relay: relay.clone(), connection })
     }
 
