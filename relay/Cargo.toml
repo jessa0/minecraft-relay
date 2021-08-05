@@ -11,12 +11,12 @@ async-io = "1.3"
 async-net = "1.5"
 bytes = "1.0"
 derive_more = "0.99"
-env_logger = { version = "0.8", default-features = false, features = ["atty", "humantime", "termcolor"] }
+env_logger = { version = "0.9", default-features = false, features = ["atty", "humantime", "termcolor"] }
 futures-lite = "1.11"
 log = "0.4"
 minecraft-relay-protocol = { path = "../protocol" }
-nom = "6.1"
-prost = "0.7"
-snow = "0.7"
+nom = "6.2"
+prost = "0.8"
+snow = "0.8"
 socket2 = { version = "0.3", features = ["reuseport"] }
 thiserror = "1.0"
