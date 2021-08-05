@@ -67,6 +67,8 @@ impl DiscoveryListener {
     pub fn new() -> io::Result<Self> {
         let socket = Socket::new(socket2::Domain::ipv4(), socket2::Type::dgram(), None)?;
         socket.set_reuse_address(true)?;
+        #[cfg(target_vendor = "apple")]
+        socket.set_reuse_port(true)?;
         socket.bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, PORT)).into())?;
         socket.join_multicast_v4(&MULTICAST_GROUP, &Ipv4Addr::UNSPECIFIED)?;
         Ok(Self { socket: socket.into() })
